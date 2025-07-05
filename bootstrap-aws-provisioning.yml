@@ -303,13 +303,12 @@ Resources:
   # IAM ROLE FOR OPENTOFU APPLY OPERATIONS (FULL PERMISSIONS)
   # -----------------------------------------------------------------------------
   # This role has broad permissions for infrastructure provisioning
-  # Should be restricted to trusted branches (typically main/master)
   GitHubActionsApplyRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Ref ApplyRoleName
 
-      # Trust policy - more restrictive than plan role
+      # Trust policy - defines who can assume this role
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
