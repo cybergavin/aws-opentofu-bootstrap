@@ -1,0 +1,461 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Bootstrap CloudFormation template for OpenTofu infrastructure.
+  Creates S3 bucket and DynamoDB table for remote state management,
+  plus GitHub OIDC provider and IAM roles for secure CI/CD automation.
+  This template establishes the foundational infrastructure needed before
+  running any OpenTofu configurations.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+# Input parameters allow customization during stack deployment
+Parameters:
+  StateBucket:
+    # Must be globally unique across all AWS accounts
+    Type: String
+    Description: "Name for the S3 bucket that will store OpenTofu state files"
+
+  StateTable:
+    # Prevents concurrent modifications to the same state file
+    Type: String
+    Description: "Name for the DynamoDB table used for state locking and consistency"
+
+  GitHubOrganization:
+    # Used in OIDC trust relationship to restrict access
+    Type: String
+    Description: "GitHub Organization or Username that owns the repositories"
+
+  GitHubRepository:
+    # Restricts which repositories can assume the IAM roles
+    Type: String
+    Description: "GitHub Repository Name"
+
+  PlanRoleName:
+    # This role has read-only access for planning and validation
+    Type: String
+    Description: "Name for the read-only IAM role used by 'tofu plan' operations"
+    Default: "github-actions-tofu-plan"
+
+  ApplyRoleName:
+    # This role has full permissions for infrastructure changes
+    Type: String
+    Description: "Name for the IAM role used by 'tofu apply' operations"
+    Default: "github-actions-tofu-apply"
+
+  GitHubOIDCThumbprint:
+    # Certificate thumbprint changes when GitHub rotates their certificates
+    # Should be retrieved dynamically by wrapper scripts using:
+    # openssl s_client -servername token.actions.githubusercontent.com -showcerts \
+    # -connect token.actions.githubusercontent.com:443 \
+    # < /dev/null 2>/dev/null | openssl x509 -fingerprint -sha1 -noout
+    Type: String
+    Description: "Current certificate thumbprint for token.actions.githubusercontent.com"
+    NoEcho: false
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+
+Resources:
+  # -----------------------------------------------------------------------------
+  # S3 BUCKET FOR OpenTofu STATE
+  # -----------------------------------------------------------------------------
+  # Primary bucket for storing state files with versioning and encryption
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName:
+        Fn::Sub:
+          - "${StateBucket}"
+          - StateBucket: !Ref StateBucket
+
+      # Enable versioning to maintain history of state changes
+      # Critical for rollback capabilities and accident recovery
+      VersioningConfiguration:
+        Status: "Enabled"
+
+      # Encrypt all objects at rest using AES-256
+      # Protects sensitive infrastructure details in state files
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+
+      # Block all public access - state files should never be public
+      # Critical security measure to prevent exposure of infrastructure details
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      # Lifecycle management for cost optimization and cleanup
+      LifecycleConfiguration:
+        Rules:
+          - Id: "ExpireVeryOldVersions"
+            Status: "Enabled"
+            NoncurrentVersionExpirationInDays: 1095 # 3 years
+            # Keep old versions for extended period to allow rollbacks
+
+          - Id: "CleanupIncompleteMultipartUploads"
+            Status: "Enabled"
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+              # Clean up failed uploads to reduce costs
+
+      # Access logging for audit trail and troubleshooting
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3LogBucket
+        LogFilePrefix: "tfstate-access-logs/"
+
+  # -----------------------------------------------------------------------------
+  # S3 BUCKET POLICY - ENFORCE HTTPS
+  # -----------------------------------------------------------------------------
+  # Security policy to ensure all access uses encrypted transport
+  S3BucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Deny any requests that don't use HTTPS
+          # Prevents credentials and state data from being transmitted in clear text
+          - Effect: Deny
+            Principal:
+              AWS: "*" # Applies to all principals
+            Action: "*" # For any actions
+            Resource:
+              # Apply to both bucket and all objects within it
+              - Fn::Sub:
+                  - "arn:aws:s3:::${S3Bucket}" # Bucket ARN
+                  - S3Bucket: !Ref S3Bucket
+              - Fn::Sub:
+                  - "arn:aws:s3:::${S3Bucket}/*" # Objects in the bucket
+                  - S3Bucket: !Ref S3Bucket
+            Condition:
+              Bool:
+                "aws:SecureTransport": false # Only when SecureTransport is false
+
+  # -----------------------------------------------------------------------------
+  # S3 BUCKET FOR ACCESS LOGS
+  # -----------------------------------------------------------------------------
+  # Separate bucket for storing access logs from the main state bucket
+  S3LogBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName:
+        Fn::Sub:
+          - "${StateBucket}-logs"
+          - StateBucket: !Ref StateBucket
+
+      # Shorter retention for access logs since they're primarily for troubleshooting
+      LifecycleConfiguration:
+        Rules:
+          - Id: "ExpireOldLogs"
+            Status: "Enabled"
+            ExpirationInDays: 30 # Logs are less critical than state files
+
+      # Same security posture as main bucket
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # -----------------------------------------------------------------------------
+  # S3 LOG BUCKET POLICY - ENFORCE HTTPS
+  # -----------------------------------------------------------------------------
+  # Same HTTPS enforcement for the logging bucket
+  S3LogBucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket: !Ref S3LogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny
+            Principal:
+              AWS: "*" # All principals should use HTTPS
+            Action: "*" # For any actions
+            Resource:
+              - Fn::Sub:
+                  - "arn:aws:s3:::${S3LogBucket}" # Bucket ARN
+                  - S3LogBucket: !Ref S3LogBucket
+              - Fn::Sub:
+                  - "arn:aws:s3:::${S3LogBucket}/*" # Objects in the bucket
+                  - S3LogBucket: !Ref S3LogBucket
+            Condition:
+              Bool:
+                "aws:SecureTransport": false
+
+  # -----------------------------------------------------------------------------
+  # DYNAMODB TABLE FOR STATE LOCKING
+  # -----------------------------------------------------------------------------
+  # Provides distributed locking mechanism to prevent concurrent state modifications
+  DynamoDBTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      TableName:
+        Fn::Sub:
+          - "${StateTable}"
+          - StateTable: !Ref StateTable
+
+      # Pay-per-request pricing is cost-effective for infrequent lock operations
+      BillingMode: "PAY_PER_REQUEST"
+
+      # Schema required by OpenTofu for state locking
+      AttributeDefinitions:
+        - AttributeName: "LockID" # Primary key for lock entries
+          AttributeType: "S" # String type
+
+      KeySchema:
+        - AttributeName: "LockID"
+          KeyType: "HASH" # Partition key
+
+      # Enable encryption at rest for security
+      SSESpecification:
+        SSEEnabled: true
+
+  # -----------------------------------------------------------------------------
+  # GITHUB OIDC IDENTITY PROVIDER
+  # -----------------------------------------------------------------------------
+  # Enables GitHub Actions to authenticate with AWS without long-lived credentials
+  # Uses OpenID Connect (OIDC) for secure, temporary credential exchange
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      # GitHub's OIDC token endpoint
+      Url: https://token.actions.githubusercontent.com
+
+      # Audience that tokens are intended for (AWS STS)
+      ClientIdList:
+        - sts.amazonaws.com
+
+      # Certificate thumbprint for GitHub's token endpoint
+      # Must match current certificate or authentication will fail
+      ThumbprintList:
+        - !Ref GitHubOIDCThumbprint
+
+  # -----------------------------------------------------------------------------
+  # IAM ROLE FOR OPENTOFU PLAN OPERATIONS (READ-ONLY)
+  # -----------------------------------------------------------------------------
+  # This role is used for planning, validation, and drift detection
+  # Has read-only access to AWS resources plus state management permissions
+  GitHubActionsPlanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref PlanRoleName
+
+      # Trust policy - defines who can assume this role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProvider # Only GitHub OIDC can assume
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                # Verify the token audience
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+              StringLike:
+                # Allow any branch/PR from the specified org/repo
+                # This enables plan operations on pull requests
+                "token.actions.githubusercontent.com:sub":
+                  - !Sub "repo:${GitHubOrganization}/${GitHubRepository}:*"
+
+      # AWS managed policy for read-only access to all services
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+
+      # Custom policy for state management operations
+      Policies:
+        - PolicyName: "OpenTofuStateAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # S3 permissions for state file operations
+              - Effect: Allow
+                Action:
+                  - s3:GetObject # Read existing state
+                  - s3:PutObject # Write updated state (even for plan operations)
+                  - s3:DeleteObject # Remove state if needed
+                Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
+
+                # S3 bucket-level permissions
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket # List state files
+                Resource: !Sub "arn:aws:s3:::${S3Bucket}"
+
+                # DynamoDB permissions for state locking
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem # Check existing locks
+                  - dynamodb:PutItem # Acquire locks
+                  - dynamodb:DeleteItem # Release locks
+                Resource: !GetAtt DynamoDBTable.Arn
+
+  # -----------------------------------------------------------------------------
+  # IAM ROLE FOR OPENTOFU APPLY OPERATIONS (FULL PERMISSIONS)
+  # -----------------------------------------------------------------------------
+  # This role has broad permissions for infrastructure provisioning
+  # Should be restricted to trusted branches (typically main/master)
+  GitHubActionsApplyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref ApplyRoleName
+
+      # Trust policy - more restrictive than plan role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+              StringLike:
+                "token.actions.githubusercontent.com:sub":
+                  - !Sub "repo:${GitHubOrganization}/${GitHubRepository}:*"
+
+      # Comprehensive permissions for infrastructure management
+      Policies:
+        - PolicyName: "OpenTofuApplyPermissions"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # State management permissions (same as plan role)
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${S3Bucket}"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt DynamoDBTable.Arn
+
+                # Full access to core AWS services for infrastructure provisioning
+
+                # EC2 - Virtual machines, networking, storage
+                # Note: VPC operations are part of EC2 service namespace
+              - Effect: Allow
+                Action:
+                  - ec2:*
+                Resource: "*"
+
+                # Containers - ECS and ECR for container orchestration and image storage
+              - Effect: Allow
+                Action:
+                  - ecr:*
+                Resource: "*"
+
+              - Effect: Allow
+                Action:
+                  - ecs:*
+                Resource: "*"
+
+                # S3 - Object storage
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource: "*"
+
+                # IAM - Identity and access management
+                # Required for creating service roles and policies
+              - Effect: Allow
+                Action:
+                  - iam:*
+                Resource: "*"
+
+                # Secrets Manager - Secure storage for sensitive data
+              - Effect: Allow
+                Action:
+                  - secretsmanager:*
+                Resource: "*"
+
+                # Additional services commonly needed for infrastructure automation
+
+                # Monitoring, logging, metrics, outputs and resource shares
+              - Effect: Allow
+                Action:
+                  - logs:*
+                  - cloudwatch:*
+                  - cloudtrail:*
+                  - ssm:*
+                  - ram:*
+                Resource: "*"
+
+                # Elastic Load Balancing - Distribute incoming traffic
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:*
+                Resource: "*"
+
+                # ACM - SSL/TLS certificate management
+              - Effect: Allow
+                Action:
+                  - acm:*
+                Resource: "*"
+
+                # KMS - Key management for encryption
+              - Effect: Allow
+                Action:
+                  - kms:*
+                Resource: "*"
+
+                # AWS Organizations
+              - Effect: Allow
+                Action:
+                  - organizations:*
+                Resource: "*"
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+# Export important values for use by other stacks or external tools
+Outputs:
+  S3BucketName:
+    Description: Name of the created S3 bucket for OpenTofu state
+    Value: !Ref S3Bucket
+    # Used in backend configuration: bucket = "bucket-name"
+
+  DynamoDBTableName:
+    Description: Name of the created DynamoDB table for state locking
+    Value: !Ref DynamoDBTable
+    # Used in backend configuration: dynamodb_table = "table-name"
+
+  GitHubOIDCProviderArn:
+    Description: ARN of the GitHub OIDC Identity Provider
+    Value: !Ref GitHubOIDCProvider
+    Export:
+      Name: !Sub "${AWS::StackName}-github-oidc-provider"
+      # Can be referenced by other stacks that need GitHub OIDC integration
+
+  GitHubActionsPlanRoleArn:
+    Description: ARN of the GitHub Actions OpenTofu Plan role (read-only)
+    Value: !GetAtt GitHubActionsPlanRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-github-plan-role"
+      # Use this role ARN in GitHub Actions for plan operations
+
+  GitHubActionsApplyRoleArn:
+    Description: ARN of the GitHub Actions OpenTofu Apply role
+    Value: !GetAtt GitHubActionsApplyRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-github-apply-role"
+      # Use this role ARN in GitHub Actions for apply operations
+      # Should only be used from trusted branches
