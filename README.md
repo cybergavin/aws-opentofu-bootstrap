@@ -41,6 +41,7 @@ Before running this bootstrap:
 
 ```bash
 ./bootstrap.sh <TENANT> <ENVIRONMENT>
+```
 Arguments:
 
 TENANT: Logical name for a team or workload (e.g., appx, dataops)
@@ -63,8 +64,8 @@ The script:
   - Create GitHub environments, environment protection rules and variables
 
 
-🧩 Where This Fits
+## 🧩 Where This Fits
 This is typically the first step in a larger GitOps or platform engineering workflow. Once bootstrapped, teams can start provisioning infrastructure using OpenTofu, backed by GitHub CI/CD pipelines.
 
-📖 Related Blog Post
+## 📖 Related Blog Post
 From Zero to IaC: Bootstrapping AWS Accounts for OpenTofu with CloudFormation & GitHub Actions
